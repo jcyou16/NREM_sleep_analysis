@@ -1,0 +1,138 @@
+function [artifact, pct_artifact, lowV, highV, EMG] = detectEEGartifact(EEG, Fs, lowV_cutoff, highV_cutoff, EMG_cutoff, varargin)
+
+% Artifact detector version 3 (20260512) by JCY
+    % Update from version 1 (20260123): added varargin input to deal with different window sizes
+    % Update from version 2 (20260225): added optional outForm input to specify output format if needed
+
+% Inputs:
+    % EEG = *single-channel* EEG data in uV as a vector, with time scale represented by samples (does not work on multiple channels)
+    % Fs = sampling frequency in Hz (must be >100 Hz for the 30-50 Hz EMG filter)
+    % lowV_cutoff = low voltage cutoff in uV, compared against the standard deviation of the EEG signal within each window
+    % highV_cutoff = high voltage (saturation) cutoff in uV
+    % EMG_cutoff = myogenic (EMG) artifact cutoff in standard deviation(s) of 30-50 Hz signal
+    % winSize (optional input via varargin) = allows user to specify window size in seconds (non-overlapping), must be 5, 6, 10, 15, or 30
+        % Default winSize is 5 seconds if no winSize is specified by user
+        % Note that if the EEG is *not* trimmed to be divisible by winSize, then there may be a few seconds at the end without artifact labeling
+    % outForm (optional input via varargin) = allows user to specify output format 
+        % Default outForm is 'samp'(output will be in samples) if no outForm is specified by user
+        % Alternative outForm is 'win' (output will scale with size of analysis windows specified by winSize)
+
+% Outputs:
+    % artifact = logical array indicating 1 where any artifact is present across length of EEG with time scale either in samples or windows depending on outForm input
+    % pct_artifact = percent of EEG recording with artifact
+    % lowV = logical array indicating 1 where lowV is present across length of EEG (in samples or windows depending on outForm)
+    % highV = logical array indicating 1 where highV is present across length of EEG (in samples or windows depending on outForm)
+    % EMG = logical array indicating 1 where EMG artifact is present across length of EEG (in samples or windows depending on outForm)
+
+%% Determine window size and output format
+
+switch nargin
+    case 5
+        % If no specific input for winSize or outForm, set to default values for each
+        winSize = 5;
+        outForm = 'samp';
+    case 6
+        % If 1 optional input is present
+        if isempty(varargin{1})
+            % If no inputs are specified for either winSize or outForm, set default values for both
+            winSize = 5;
+            outForm = 'samp';
+        elseif isscalar(varargin{1}) && isnumeric(varargin{1}) && ismember(varargin{1}, [5 6 10 15 30])
+            % If optional input corresponds to possible values of winSize
+            winSize = varargin{1};
+            outForm = 'samp';  % set outForm to default value
+        elseif strcmpi(varargin{1}, 'samp') || strcmpi(varargin{1}, 'win')
+            % If optional input corresponds to possible values of outForm
+            if isstring(varargin{1})
+                outForm = char(varargin{1});
+            else
+                outForm = varargin{1};
+            end
+            winSize = 5;  % set winSize to default value
+        else
+            error('Invalid input for window size or output format.');
+        end
+    case 7
+        % If 2 optional inputs are present
+        if isempty(varargin{1}) && isempty(varargin{2})
+            % If no inputs are specified for either winSize or outForm, set default values for both
+            winSize = 5;
+            outForm = 'samp';
+        elseif (isscalar(varargin{1}) && isnumeric(varargin{1}) && ismember(varargin{1}, [5 6 10 15 30])) && isempty(varargin{2})
+            % If only 1 optional input is specified and corresponds to possible values of winSize
+            winSize = varargin{1};
+            outForm = 'samp';   % set outForm to default value
+        elseif isempty(varargin{1}) && (strcmpi(varargin{2}, 'samp') || strcmpi(varargin{2}, 'win'))
+            % If only 1 optional input is specified and corresponds to possible values of outForm
+            if isstring(varargin{2})
+                outForm = char(varargin{2});
+            else
+                outForm = varargin{2};
+            end
+            winSize = 5;  % set winSize to default value
+        elseif (isscalar(varargin{1}) && isnumeric(varargin{1}) && ismember(varargin{1}, [5 6 10 15 30])) && (strcmpi(varargin{2}, 'samp') || strcmpi(varargin{2}, 'win'))
+            % If inputs are specified for both winSize and outForm
+            winSize = varargin{1};
+            if isstring(varargin{2})
+                outForm = char(varargin{2});
+            else
+                outForm = varargin{2};
+            end
+        else
+            error('Invalid input(s) for window size and/or output format.');
+        end
+    otherwise
+        error('Inappropriate number of inputs for artifact detector.');
+end
+outForm = lower(outForm);  % ensure outForm matches the lowercase case labels below
+
+%% Filter EMG (30-50 Hz) signal
+
+EEG = double(EEG);  % convert EEG to double precision to improve filter function as filter is bidirectional
+[bE, aE] = butter(6, [30 50] / (Fs/2));  % Butterworth bandpass filter between 30-50 Hz, digital filters use frequencies normalized to the Nyquist frequency (Fs/2), so input values represent ratios and must range between 0 and 1
+EMGsignal = filtfilt(bE, aE, EEG);   % apply filter using bE and aE as transfer coefficients to obtain EMG band signal
+EMGstd = std(EMGsignal);  % calculate standard deviation of EMG band signal for whole EEG recording
+
+%% Pre-allocate artifact output arrays
+
+switch outForm
+    case 'samp'
+        winSamp = Fs * winSize;  % determine number of samples in each *non-overlapping* sliding window
+        numWin = fix(length(EEG)/winSamp);   % calculate # of windows in EEG based on specified winSize (rounded down to avoid incomplete windows)
+        artifact = false(length(EEG), 1);  % initialize artifact logical array
+        lowV = false(length(EEG), 1);      % initialize low voltage logical array
+        highV = false(length(EEG), 1);     % initialize high voltage logical array
+        EMG = false(length(EEG), 1);       % initialize EMG artifact logical array
+    case 'win'
+        winSamp = Fs * winSize;  % determine number of samples in each *non-overlapping* sliding window
+        numWin = fix(length(EEG)/winSamp);  % calculate # of windows in EEG based on specified winSize (rounded down to avoid incomplete windows)
+        artifact = false(numWin, 1);    % initialize artifact logical array
+        lowV = false(numWin, 1);        % initialize low voltage logical array
+        highV = false(numWin, 1);       % initialize high voltage logical array
+        EMG = false(numWin, 1);         % initialize EMG artifact logical array
+end
+
+%% Detect artifact and calculate pct_artifact
+
+switch outForm
+    case 'samp'
+        for n = 1 : numWin
+            winEEG = EEG((n-1)*winSamp+1 : n*winSamp);  % extract current window of EEG signal
+            winEMG = EMGsignal((n-1)*winSamp+1 : n*winSamp);  % extract current window of EMG signal
+            lowV((n-1)*winSamp+1 : n*winSamp) = repmat(std(winEEG) < lowV_cutoff, winSamp, 1);  % check for low voltage artifact
+            highV((n-1)*winSamp+1 : n*winSamp) = repmat(max(abs(winEEG)) > highV_cutoff, winSamp, 1);  % check for high voltage artifact
+            EMG((n-1)*winSamp+1 : n*winSamp) = repmat(std(winEMG) > (EMG_cutoff * EMGstd), winSamp, 1);  % check for EMG artifact
+            artifact((n-1)*winSamp+1 : n*winSamp) = lowV((n-1)*winSamp+1 : n*winSamp) | highV((n-1)*winSamp+1 : n*winSamp) | EMG((n-1)*winSamp+1 : n*winSamp);  % determine if any artifact is present
+        end
+        pct_artifact = sum(artifact) / length(artifact) * 100;  % calculate percentage of artifact presence
+    case 'win'
+        for n = 1 : numWin
+            winEEG = EEG((n-1)*winSamp+1 : n*winSamp);  % extract current window of EEG signal
+            winEMG = EMGsignal((n-1)*winSamp+1 : n*winSamp);  % extract current window of EMG signal
+            lowV(n) = std(winEEG) < lowV_cutoff;  % check for low voltage artifact
+            highV(n) = max(abs(winEEG)) > highV_cutoff;  % check for high voltage artifact
+            EMG(n) = std(winEMG) > (EMG_cutoff * EMGstd);  % check for EMG artifact
+            artifact(n) = lowV(n) | highV(n) | EMG(n);  % determine if any artifact is present
+        end
+        pct_artifact = sum(artifact) / length(artifact) * 100;  % calculate percentage of artifact presence
+end
