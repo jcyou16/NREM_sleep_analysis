@@ -1,0 +1,112 @@
+function SWA_results = analyzeSWA(spec, sleep_staging, channels, freq, bin_size)
+
+% Calculates band power for slow wave activity (SWA) across EEG channels and brain regions of interest (ROI)
+
+% Requires the following inputs:
+    % spec = multitaper spectrogram in channels x time x frequency format and linear power units (not dB)
+    % sleep_staging = sleep staging in 30-second epochs as a column vector, where 0 = wake, 1 = N1, 2 = N2, 3 = N3, and 4 = REM
+    % channels = EEG channel labels, in the same order as the channel dimension of spec (must contain Fp1, Fp2, F3, F4, T3, T4, T5, T6, C3, C4, P3, P4, O1, O2)
+    % freq = frequency distribution of spectrogram
+    % bin_size = time step between spectrogram time bins (in seconds), must divide evenly into 30
+
+%% Section 1: Reformat time dimension of spec to 30-second windows, matching the duration of sleep_staging epochs
+
+% Calculate multiplicative factor that will convert bin_size of spec to match that of sleep_staging
+win_factor = 30 / bin_size;
+
+% Calculate number of 30-second windows in spec and sleep_staging
+num_win30s_spec = floor(size(spec, 2) / win_factor);      % calculate # of 30-sec windows in spec (rounding down, so may lose a few sec at end)
+num_win30s_staging = numel(sleep_staging);     % calculate # of 30-sec windows in sleep_staging (this will be the # of windows that will be created for spec_30s below)
+if ~(num_win30s_spec >= num_win30s_staging)   % ensure # of windows in sleep_staging is congruent with that of the spectrogram
+    error('# of epochs in sleep_staging exceeds duration of spectrogram.');
+end
+
+% Calculate # of spectrogram time bins in spec (samps2convert) that will be converted to 30-sec windows
+samps2convert = num_win30s_staging * win_factor;
+
+% Create a vector of sample indices in spec that mark the start and end of every 30-second epoch
+samp_idx_start30s = (1:win_factor:samps2convert)';
+samp_idx_end30s = (0:win_factor:samps2convert)';
+samp_idx_end30s(1) = [];     % deletes the first entry (0) since you cannot index the 0th element of a matrix
+
+% Convert spec to have 30-sec windows through averaging spectral power across time bins within each 30-sec window
+spec_30s = zeros(size(spec, 1), num_win30s_staging, size(spec, 3));    % pre-allocate
+for win_idx = 1:num_win30s_staging
+    spec_30s(:, win_idx, :) = mean(spec(:, samp_idx_start30s(win_idx):samp_idx_end30s(win_idx), :), 2, 'omitnan');
+end
+
+%% Section 2: Calculate SWA power for all channels and windows during NREM sleep (SWA_raw)
+
+% Filter spec_30s to contain only windows corresponding to NREM2 or NREM3 sleep epochs
+spec_NREM = spec_30s(:, sleep_staging == 2 | sleep_staging == 3, :);
+
+% Specify frequency bands to analyze
+freqbands = [[0.6 1]; [1 4]; [0.6 4]];
+
+% Initialize frequency band analysis output matrix (raw output containing data from all channels and all windows with NREM epochs)
+SWA_raw = zeros(size(spec_NREM, 1), size(spec_NREM, 2), size(freqbands, 1) +1);    % +1 to pre-allocate additional space for insertion of relative freqband power calculation results (see below)
+
+for this_freqband = 1:size(freqbands, 1)
+    % Determine the indices in freq that correspond to specific frequency band being analyzed
+    freq_min = freqbands(this_freqband, 1);  % min frequency for this band
+    freq_max = freqbands(this_freqband, 2);  % max frequency for this band
+    bin_freq_min = find(freq >= freq_min, 1, 'first');
+    bin_freq_max = find(freq <= freq_max, 1, 'last');
+
+    for this_channel = 1:size(SWA_raw, 1)
+        for this_time = 1:size(SWA_raw, 2)
+        % Calculate absolute power in this_freqband (area under the curve)
+        y = spec_NREM(this_channel, this_time, bin_freq_min:bin_freq_max);    % power spectrum for this_channel, this_timepoint, within the freq bin
+        x = freq(2) - freq(1);      % frequency bin spacing
+        abs_power = trapz(x,y);     % trapezoidal integration of spec_NREM, for this freqband
+        SWA_raw(this_channel, this_time, this_freqband) = abs_power;
+        end
+    end
+end
+
+% Calculate relative power of [0.6 to 1] / [0.6 to 4] freqbands
+SWA_raw(:,:,end) = SWA_raw(:,:,1) ./ SWA_raw(:,:,3);
+
+%% Section 3: Calculate median SWA power across NREM for each channel
+    % Useful for plotting spectral topographs
+
+SWA_byChan = median(SWA_raw, 2, 'omitnan');    % calculate median power for each freqband across all NREM epochs
+SWA_byChan = squeeze(SWA_byChan);              % SWA_byChan = channels x freqband power [0.6-1, 1-4, 0.6-4, (0.6-1)/(0.6-4)]
+
+%% Section 4: Calculate mean regional SWA power across NREM
+
+% Specify channels for regions of interest (ROI)
+fp_chan = {'Fp1'; 'Fp2'};                   % frontopolar
+fr_chan = {'F3'; 'F4'};                     % frontal
+tmp_chan = {'T3'; 'T5'; 'T4'; 'T6'};        % temporal
+cen_chan = {'C3'; 'C4'};                    % central
+par_chan = {'P3'; 'P4'};                    % parietal
+occ_chan = {'O1'; 'O2'};                    % occipital
+
+% Specify channel indices for each region of interest (ROI)
+fp_chan_idx = contains(channels, fp_chan, 'IgnoreCase', 1);       % frontopolar
+fr_chan_idx = contains(channels, fr_chan, 'IgnoreCase', 1);       % frontal
+tmp_chan_idx = contains(channels, tmp_chan, 'IgnoreCase', 1);     % temporal
+cen_chan_idx = contains(channels, cen_chan, 'IgnoreCase', 1);     % central
+par_chan_idx = contains(channels, par_chan, 'IgnoreCase', 1);     % parietal
+occ_chan_idx = contains(channels, occ_chan, 'IgnoreCase', 1);     % occipital
+
+% Calculate SWA power for each ROI and concatenate results
+SWA_byROI = zeros(6, size(SWA_byChan, 2));                              % pre-allocate
+SWA_byROI(1, :) = mean(SWA_byChan(fp_chan_idx, :), 1, 'omitnan');       % calculate frontopolar SWA power
+SWA_byROI(2, :) = mean(SWA_byChan(fr_chan_idx, :), 1, 'omitnan');       % calculate frontal SWA power
+SWA_byROI(3, :) = mean(SWA_byChan(tmp_chan_idx, :), 1, 'omitnan');      % calculate temporal SWA power
+SWA_byROI(4, :) = mean(SWA_byChan(cen_chan_idx, :), 1, 'omitnan');      % calculate central SWA power
+SWA_byROI(5, :) = mean(SWA_byChan(par_chan_idx, :), 1, 'omitnan');      % calculate parietal SWA power
+SWA_byROI(6, :) = mean(SWA_byChan(occ_chan_idx, :), 1, 'omitnan');      % calculate occipital SWA power
+
+%% Section 5: Finalize output
+
+% Create datatables for visualization of SWA output
+SWA_byChan = array2table(SWA_byChan, 'VariableNames', {'0.6-1 Hz', '1-4 Hz', '0.6-4 Hz', '(0.6-1 Hz)/(0.6-4 Hz)'}, 'RowNames', channels);
+SWA_byROI = array2table(SWA_byROI, 'VariableNames', {'0.6-1 Hz', '1-4 Hz', '0.6-4 Hz', '(0.6-1 Hz)/(0.6-4 Hz)'}, 'RowNames', {'frontopolar'; 'frontal'; 'temporal'; 'central'; 'parietal'; 'occipital'});
+
+% Return results as function output
+SWA_results.SWA_raw = SWA_raw;
+SWA_results.SWA_byChan = SWA_byChan;
+SWA_results.SWA_byROI = SWA_byROI;
